@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EPUB → Myanmar Translator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--bd:#ddd;--ac:#2f5fd0}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--mut:#999;--bd:#333;--ac:#7aa2ff}}
+body{font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:640px;margin:0 auto;padding:20px}
+label{display:block;margin:14px 0 4px;font-weight:600}
+input,select,textarea,button{width:100%;box-sizing:border-box;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+button{background:var(--ac);color:#fff;border:0;margin-top:16px;font-weight:600}
+button:disabled{opacity:.5}
+progress{width:100%;margin-top:14px}
+#log{font-size:13px;color:var(--mut);white-space:pre-wrap;margin-top:8px}
+</style></head><body>
+<h2>EPUB → Myanmar</h2>
+<label>EPUB file</label><input type="file" id="file" accept=".epub">
+<label>Style</label>
+<select id="style">
+<option value="novel">Novel (modern, natural)</option>
+<option value="literary">Literary (သည်/၏)</option>
+<option value="nonfiction">Non-fiction / essay</option>
+</select>
+<label>Glossary (optional, one per line: Name = မြန်မာ)</label>
+<textarea id="gloss" rows="4"></textarea>
+<label>Password</label><input type="password" id="pw">
+<button id="go">Translate</button>
+<progress id="bar" value="0" max="1" hidden></progress>
+<div id="log"></div>
+<script>
+const $=id=>document.getElementById(id), log=m=>$("log").textContent=m;
+const SEL="p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption,dt,dd,td,th,caption";
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+async function call(texts,context){
+  for(let i=0;i<4;i++){
+    const r=await fetch("/api/translate",{method:"POST",
+      headers:{"content-type":"application/json","x-app-password":$("pw").value},
+      body:JSON.stringify({texts,style:$("style").value,glossary:$("gloss").value,context})});
+    const j=await r.json();
+    if(r.ok) return j.translations;
+    if(r.status===401) throw new Error("Wrong password");
+    await sleep(1500*(i+1));
+  }
+  throw new Error("Batch failed after retries");
+}
+
+$("go").onclick=async()=>{
+  const f=$("file").files[0]; if(!f) return log("Choose an EPUB first");
+  $("go").disabled=true; $("bar").hidden=false;
+  try{
+    const zip=await JSZip.loadAsync(await f.arrayBuffer());
+    const P=new DOMParser();
+    const cont=P.parseFromString(await zip.file("META-INF/container.xml").async("string"),"application/xml");
+    const opfPath=cont.querySelector("rootfile").getAttribute("full-path");
+    const base=opfPath.includes("/")?opfPath.replace(/[^/]+$/,""):"";
+    const opfStr=await zip.file(opfPath).async("string");
+    const opf=P.parseFromString(opfStr,"application/xml");
+    const files=[...opf.querySelectorAll("manifest > item")]
+      .filter(i=>i.getAttribute("media-type")==="application/xhtml+xml")
+      .map(i=>base+decodeURIComponent(i.getAttribute("href")));
+    // set language to Myanmar
+    const lang=opf.querySelector("language"); if(lang) lang.textContent="my";
+    zip.file(opfPath,new XMLSerializer().serializeToString(opf));
+
+    // collect work
+    const docs=[];let total=0;
+    for(const p of files){
+      const e=zip.file(p); if(!e) continue;
+      const doc=P.parseFromString(await e.async("string"),"application/xhtml+xml");
+      if(doc.querySelector("parsererror")) continue;
+      const els=[...doc.querySelectorAll(SEL)].filter(el=>!el.querySelector(SEL)&&el.textContent.trim());
+      const t=doc.querySelector("title"); if(t&&t.textContent.trim()) els.unshift(t);
+      docs.push({p,doc,els}); total+=els.length;
+    }
+    $("bar").max=total;let done=0,ctx="";
+    for(const {p,doc,els} of docs){
+      let i=0;
+      while(i<els.length){
+        const batch=[];let chars=0;
+        while(i+batch.length<els.length&&batch.length<25&&chars<3000){
+          const t=els[i+batch.length].textContent.trim();batch.push(t);chars+=t.length;
+        }
+        const out=await call(batch,ctx);
+        out.forEach((t,k)=>{els[i+k].textContent=t});
+        ctx=out.slice(-3).join("\n");
+        i+=batch.length;done+=batch.length;$("bar").value=done;
+        log(`Translated ${done} / ${total} paragraphs`);
+      }
+      doc.documentElement.setAttribute("xml:lang","my");
+      doc.documentElement.setAttribute("lang","my");
+      zip.file(p,new XMLSerializer().serializeToString(doc));
+    }
+    zip.file("mimetype","application/epub+zip",{compression:"STORE"});
+    const blob=await zip.generateAsync({type:"blob",mimeType:"application/epub+zip",compression:"DEFLATE"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+    a.download=f.name.replace(/\.epub$/i,"")+".my.epub";a.click();
+    log("Done ✓ Downloaded.");
+  }catch(e){log("Error: "+e.message)}
+  $("go").disabled=false;
+};
+</script></body></html>
